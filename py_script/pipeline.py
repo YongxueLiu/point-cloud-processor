@@ -21,7 +21,6 @@ Enhanced Logging:
 - Track velocity & classification
 """
 
-import struct
 import time
 from typing import Optional
 
@@ -29,6 +28,7 @@ import numpy as np
 import open3d as o3d
 import rclpy
 from builtin_interfaces.msg import Duration
+from geometry_msgs.msg import Point
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -58,6 +58,10 @@ SPEED_THRESHOLD     = 0.15    # m/s – dynamic vs static
 MARKER_LIFETIME_NS  = 500_000_000
 WALL_NORMAL_THRESHOLD = 0.3  # |z_component| < 0.3 indicates vertical wall
 wall_inliers_threshold = 300 # 增加最小墙面尺寸约束（防小平面误删）
+BBOX_TEXT_Z_OFFSET = 0.35
+TRACK_TEXT_Z_OFFSET = 0.45
+VELOCITY_ARROW_SCALE = 0.35
+DEBUG_PUBLISH_EVERY_N_FRAMES = 5
  
 # ---------------------------------------------------------------------------
 # Helper – vectorised XYZ+RGB -> PointCloud2
@@ -95,6 +99,13 @@ def xyzrgb_to_pc2(
     ]
 
     return point_cloud2.create_cloud(header, fields, cloud_arr.tolist())
+
+
+def solid_color(count: int, rgb: tuple[float, float, float]) -> np.ndarray:
+    """Create an (N, 3) RGB array for PointCloud2 coloring."""
+    if count <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    return np.tile(np.asarray(rgb, dtype=np.float32), (count, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +248,7 @@ class IndustrialLidarNode(Node):
 
     def __init__(self) -> None:
         super().__init__("industrial_lidar_perception")
+        self.declare_parameter("rviz_debug_publish_every_n_frames", DEBUG_PUBLISH_EVERY_N_FRAMES)
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -254,17 +266,24 @@ class IndustrialLidarNode(Node):
         self.pub_cloud  = self.create_publisher(PointCloud2,   "/lidar/processed_points", qos)
         self.pub_bbox   = self.create_publisher(MarkerArray,   "/lidar/cluster_bboxes",   qos)
         self.pub_tracks = self.create_publisher(MarkerArray,   "/lidar/tracks",            qos)
-        self.pub_raw      = self.create_publisher(PointCloud2, "/debug/raw", qos)
-        self.pub_voxel    = self.create_publisher(PointCloud2, "/debug/voxel", qos)
-        self.pub_sor      = self.create_publisher(PointCloud2, "/debug/sor", qos)
-        self.pub_ground   = self.create_publisher(PointCloud2, "/debug/ground_removed", qos)
-        self.pub_wall     = self.create_publisher(PointCloud2, "/debug/wall_removed", qos)
+        self.pub_raw      = self.create_publisher(PointCloud2, "/debug/raw_points", qos)
+        self.pub_voxel    = self.create_publisher(PointCloud2, "/debug/voxel_points", qos)
+        self.pub_sor      = self.create_publisher(PointCloud2, "/debug/sor_points", qos)
+        self.pub_ground   = self.create_publisher(PointCloud2, "/debug/ground_removed_points", qos)
+        self.pub_wall     = self.create_publisher(PointCloud2, "/debug/wall_removed_points", qos)
 
         self.tracker   = MultiObjectTracker()
         self.last_time: Optional[float] = None
         self.frame_count = 0
+        self.debug_publish_every_n_frames = max(
+            1,
+            int(self.get_parameter("rviz_debug_publish_every_n_frames").value),
+        )
 
-        self.get_logger().info("Industrial LiDAR Pipeline Ready")
+        self.get_logger().info(
+            "Industrial LiDAR Pipeline Ready | "
+            f"RViz debug clouds every {self.debug_publish_every_n_frames} frame(s)"
+        )
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -293,6 +312,26 @@ class IndustrialLidarNode(Node):
         )
         remaining = pcd.select_by_index(inliers, invert=True)
         return remaining, np.asarray(plane), len(inliers)
+
+    def _publish_debug_cloud(
+        self,
+        publisher,
+        points: np.ndarray,
+        frame_id: str,
+        stamp,
+        color: tuple[float, float, float],
+    ) -> None:
+        """Publish a colored debug cloud for RViz2 visualisation."""
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        if len(points) == 0:
+            return
+        publisher.publish(
+            xyzrgb_to_pc2(points, solid_color(len(points), color), frame_id, stamp)
+        )
+
+    def _should_publish_debug_clouds(self) -> bool:
+        """Throttle intermediate RViz2 point cloud topics to reduce queue pressure."""
+        return (self.frame_count % self.debug_publish_every_n_frames) == 0
 
     #@staticmethod
     # def _classify_plane(plane_coeff: np.ndarray) -> str:
@@ -377,6 +416,16 @@ class IndustrialLidarNode(Node):
         if len(pts) == 0:
             self.get_logger().warn("Empty point cloud received – skipping frame.")
             return
+
+        publish_debug_clouds = self._should_publish_debug_clouds()
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_raw,
+                pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.8, 0.8, 0.8),
+            )
 
         # ================================================================
         # STEP 1B: Diagnose Coordinate Range & Unit Detection
@@ -521,6 +570,16 @@ class IndustrialLidarNode(Node):
 
             pcd = pcd.voxel_down_sample(0.05)
 
+        voxel_pts = np.asarray(pcd.points, dtype=np.float32)
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_voxel,
+                voxel_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (1.0, 0.7, 0.2),
+            )
+
 
 
 
@@ -545,10 +604,21 @@ class IndustrialLidarNode(Node):
         except RuntimeError as e:
             self.get_logger().warn(f"[SOR_WARN] SOR filter failed: {e}. Continuing without SOR.")
 
+        sor_pts = np.asarray(pcd.points, dtype=np.float32)
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_sor,
+                sor_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.4, 1.0, 0.4),
+            )
+
         # ================================================================
         # STEP 4: Ground Plane Removal
         # ================================================================
         pts_before_ground = len(pcd.points)
+        ground_inliers = 0
         try:
             pcd, ground_plane, ground_inliers = self._remove_dominant_plane(
                 pcd,
@@ -580,6 +650,16 @@ class IndustrialLidarNode(Node):
             )
         except RuntimeError as e:
             self.get_logger().warn(f"[GROUND_WARN] Ground removal failed: {e}. Skipping ground removal.")
+
+        ground_removed_pts = np.asarray(pcd.points, dtype=np.float32)
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_ground,
+                ground_removed_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.2, 0.9, 0.9),
+            )
 
         # ================================================================
         # STEP 5: Iterative Wall Removal
@@ -647,6 +727,16 @@ class IndustrialLidarNode(Node):
             f"[WALL_SUMMARY] Total walls removed: {wall_count}"
         )
 
+        wall_removed_pts = np.asarray(pcd.points, dtype=np.float32)
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_wall,
+                wall_removed_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.9, 0.2, 0.9),
+            )
+
         # ================================================================
         # STEP 6: Safety guard
         # ================================================================
@@ -673,6 +763,11 @@ class IndustrialLidarNode(Node):
 
         clusters: list[np.ndarray] = []
         bbox_markers              = MarkerArray()
+        clear_bbox_markers = Marker()
+        clear_bbox_markers.header.frame_id = msg.header.frame_id
+        clear_bbox_markers.header.stamp = msg.header.stamp
+        clear_bbox_markers.action = Marker.DELETEALL
+        bbox_markers.markers.append(clear_bbox_markers)
 
         self.get_logger().info(
             f"[CLUSTER] DBSCAN found {len(unique_labels)} potential clusters, "
@@ -725,6 +820,29 @@ class IndustrialLidarNode(Node):
             bbox_m.lifetime              = Duration(sec=0, nanosec=MARKER_LIFETIME_NS)
             bbox_markers.markers.append(bbox_m)
 
+            label_m                     = Marker()
+            label_m.header.frame_id     = msg.header.frame_id
+            label_m.header.stamp        = msg.header.stamp
+            label_m.ns                  = "cluster_labels"
+            label_m.id                  = 1000 + int(lab)
+            label_m.type                = Marker.TEXT_VIEW_FACING
+            label_m.action              = Marker.ADD
+            label_m.pose.position.x     = float(center[0])
+            label_m.pose.position.y     = float(center[1])
+            label_m.pose.position.z     = float(mx[2] + BBOX_TEXT_Z_OFFSET)
+            label_m.pose.orientation.w  = 1.0
+            label_m.scale.z             = 0.28
+            label_m.color.r             = 1.0
+            label_m.color.g             = 1.0
+            label_m.color.b             = 1.0
+            label_m.color.a             = 0.95
+            label_m.text                = (
+                f"Cluster {int(lab)} | {len(cluster_pts)} pts\n"
+                f"{dims[0]:.2f} x {dims[1]:.2f} x {dims[2]:.2f} m"
+            )
+            label_m.lifetime            = Duration(sec=0, nanosec=MARKER_LIFETIME_NS)
+            bbox_markers.markers.append(label_m)
+
         self.pub_bbox.publish(bbox_markers)
 
         # ================================================================
@@ -747,6 +865,11 @@ class IndustrialLidarNode(Node):
 
         tracks     = self.tracker.step(clusters, dt)
         track_msgs = MarkerArray()
+        clear_track_markers = Marker()
+        clear_track_markers.header.frame_id = msg.header.frame_id
+        clear_track_markers.header.stamp = msg.header.stamp
+        clear_track_markers.action = Marker.DELETEALL
+        track_msgs.markers.append(clear_track_markers)
 
         self.get_logger().info(
             f"[TRACKING] dt={dt:.4f}s | Active tracks: {len(tracks)}"
@@ -787,6 +910,56 @@ class IndustrialLidarNode(Node):
                 m.color.r, m.color.g, m.color.b = 0.2, 0.8, 0.2  # Green
 
             track_msgs.markers.append(m)
+
+            arrow = Marker()
+            arrow.header.frame_id      = msg.header.frame_id
+            arrow.header.stamp         = msg.header.stamp
+            arrow.ns                   = "track_velocity"
+            arrow.id                   = 1000 + t.id
+            arrow.type                 = Marker.ARROW
+            arrow.action               = Marker.ADD
+            arrow.pose.orientation.w   = 1.0
+            arrow.scale.x              = 0.08
+            arrow.scale.y              = 0.14
+            arrow.scale.z              = 0.18
+            arrow.color.a              = 0.95
+            arrow.color.r              = m.color.r
+            arrow.color.g              = m.color.g
+            arrow.color.b              = m.color.b
+            arrow.lifetime             = Duration(sec=0, nanosec=MARKER_LIFETIME_NS)
+            start_point = Point()
+            start_point.x = float(pos[0])
+            start_point.y = float(pos[1])
+            start_point.z = float(pos[2])
+            end_point = Point()
+            end_point.x = float(pos[0] + vel[0] * VELOCITY_ARROW_SCALE)
+            end_point.y = float(pos[1] + vel[1] * VELOCITY_ARROW_SCALE)
+            end_point.z = float(pos[2] + vel[2] * VELOCITY_ARROW_SCALE)
+            arrow.points = [start_point, end_point]
+            track_msgs.markers.append(arrow)
+
+            text_marker = Marker()
+            text_marker.header.frame_id    = msg.header.frame_id
+            text_marker.header.stamp       = msg.header.stamp
+            text_marker.ns                 = "track_labels"
+            text_marker.id                 = 2000 + t.id
+            text_marker.type               = Marker.TEXT_VIEW_FACING
+            text_marker.action             = Marker.ADD
+            text_marker.pose.position.x    = float(pos[0])
+            text_marker.pose.position.y    = float(pos[1])
+            text_marker.pose.position.z    = float(pos[2] + TRACK_TEXT_Z_OFFSET)
+            text_marker.pose.orientation.w = 1.0
+            text_marker.scale.z            = 0.3
+            text_marker.color.r            = 1.0
+            text_marker.color.g            = 1.0
+            text_marker.color.b            = 1.0
+            text_marker.color.a            = 0.95
+            text_marker.text               = (
+                f"ID {t.id} | {classification}\n"
+                f"{speed:.2f} m/s"
+            )
+            text_marker.lifetime           = Duration(sec=0, nanosec=MARKER_LIFETIME_NS)
+            track_msgs.markers.append(text_marker)
 
         self.pub_tracks.publish(track_msgs)
 
