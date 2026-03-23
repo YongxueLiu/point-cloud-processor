@@ -61,6 +61,7 @@ wall_inliers_threshold = 300 # 增加最小墙面尺寸约束（防小平面误�
 BBOX_TEXT_Z_OFFSET = 0.35
 TRACK_TEXT_Z_OFFSET = 0.45
 VELOCITY_ARROW_SCALE = 0.35
+DEBUG_PUBLISH_EVERY_N_FRAMES = 5
  
 # ---------------------------------------------------------------------------
 # Helper – vectorised XYZ+RGB -> PointCloud2
@@ -247,6 +248,7 @@ class IndustrialLidarNode(Node):
 
     def __init__(self) -> None:
         super().__init__("industrial_lidar_perception")
+        self.declare_parameter("rviz_debug_publish_every_n_frames", DEBUG_PUBLISH_EVERY_N_FRAMES)
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -264,17 +266,24 @@ class IndustrialLidarNode(Node):
         self.pub_cloud  = self.create_publisher(PointCloud2,   "/lidar/processed_points", qos)
         self.pub_bbox   = self.create_publisher(MarkerArray,   "/lidar/cluster_bboxes",   qos)
         self.pub_tracks = self.create_publisher(MarkerArray,   "/lidar/tracks",            qos)
-        self.pub_raw      = self.create_publisher(PointCloud2, "/debug/raw", qos)
-        self.pub_voxel    = self.create_publisher(PointCloud2, "/debug/voxel", qos)
-        self.pub_sor      = self.create_publisher(PointCloud2, "/debug/sor", qos)
-        self.pub_ground   = self.create_publisher(PointCloud2, "/debug/ground_removed", qos)
-        self.pub_wall     = self.create_publisher(PointCloud2, "/debug/wall_removed", qos)
+        self.pub_raw      = self.create_publisher(PointCloud2, "/debug/raw_points", qos)
+        self.pub_voxel    = self.create_publisher(PointCloud2, "/debug/voxel_points", qos)
+        self.pub_sor      = self.create_publisher(PointCloud2, "/debug/sor_points", qos)
+        self.pub_ground   = self.create_publisher(PointCloud2, "/debug/ground_removed_points", qos)
+        self.pub_wall     = self.create_publisher(PointCloud2, "/debug/wall_removed_points", qos)
 
         self.tracker   = MultiObjectTracker()
         self.last_time: Optional[float] = None
         self.frame_count = 0
+        self.debug_publish_every_n_frames = max(
+            1,
+            int(self.get_parameter("rviz_debug_publish_every_n_frames").value),
+        )
 
-        self.get_logger().info("Industrial LiDAR Pipeline Ready")
+        self.get_logger().info(
+            "Industrial LiDAR Pipeline Ready | "
+            f"RViz debug clouds every {self.debug_publish_every_n_frames} frame(s)"
+        )
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -319,6 +328,10 @@ class IndustrialLidarNode(Node):
         publisher.publish(
             xyzrgb_to_pc2(points, solid_color(len(points), color), frame_id, stamp)
         )
+
+    def _should_publish_debug_clouds(self) -> bool:
+        """Throttle intermediate RViz2 point cloud topics to reduce queue pressure."""
+        return (self.frame_count % self.debug_publish_every_n_frames) == 0
 
     #@staticmethod
     # def _classify_plane(plane_coeff: np.ndarray) -> str:
@@ -404,13 +417,15 @@ class IndustrialLidarNode(Node):
             self.get_logger().warn("Empty point cloud received – skipping frame.")
             return
 
-        self._publish_debug_cloud(
-            self.pub_raw,
-            pts,
-            msg.header.frame_id,
-            msg.header.stamp,
-            (0.8, 0.8, 0.8),
-        )
+        publish_debug_clouds = self._should_publish_debug_clouds()
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_raw,
+                pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.8, 0.8, 0.8),
+            )
 
         # ================================================================
         # STEP 1B: Diagnose Coordinate Range & Unit Detection
@@ -556,13 +571,14 @@ class IndustrialLidarNode(Node):
             pcd = pcd.voxel_down_sample(0.05)
 
         voxel_pts = np.asarray(pcd.points, dtype=np.float32)
-        self._publish_debug_cloud(
-            self.pub_voxel,
-            voxel_pts,
-            msg.header.frame_id,
-            msg.header.stamp,
-            (1.0, 0.7, 0.2),
-        )
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_voxel,
+                voxel_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (1.0, 0.7, 0.2),
+            )
 
 
 
@@ -589,13 +605,14 @@ class IndustrialLidarNode(Node):
             self.get_logger().warn(f"[SOR_WARN] SOR filter failed: {e}. Continuing without SOR.")
 
         sor_pts = np.asarray(pcd.points, dtype=np.float32)
-        self._publish_debug_cloud(
-            self.pub_sor,
-            sor_pts,
-            msg.header.frame_id,
-            msg.header.stamp,
-            (0.4, 1.0, 0.4),
-        )
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_sor,
+                sor_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.4, 1.0, 0.4),
+            )
 
         # ================================================================
         # STEP 4: Ground Plane Removal
@@ -635,13 +652,14 @@ class IndustrialLidarNode(Node):
             self.get_logger().warn(f"[GROUND_WARN] Ground removal failed: {e}. Skipping ground removal.")
 
         ground_removed_pts = np.asarray(pcd.points, dtype=np.float32)
-        self._publish_debug_cloud(
-            self.pub_ground,
-            ground_removed_pts,
-            msg.header.frame_id,
-            msg.header.stamp,
-            (0.2, 0.9, 0.9),
-        )
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_ground,
+                ground_removed_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.2, 0.9, 0.9),
+            )
 
         # ================================================================
         # STEP 5: Iterative Wall Removal
@@ -710,13 +728,14 @@ class IndustrialLidarNode(Node):
         )
 
         wall_removed_pts = np.asarray(pcd.points, dtype=np.float32)
-        self._publish_debug_cloud(
-            self.pub_wall,
-            wall_removed_pts,
-            msg.header.frame_id,
-            msg.header.stamp,
-            (0.9, 0.2, 0.9),
-        )
+        if publish_debug_clouds:
+            self._publish_debug_cloud(
+                self.pub_wall,
+                wall_removed_pts,
+                msg.header.frame_id,
+                msg.header.stamp,
+                (0.9, 0.2, 0.9),
+            )
 
         # ================================================================
         # STEP 6: Safety guard
